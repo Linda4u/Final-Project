@@ -1,5 +1,7 @@
 
 
+
+
 import os
 import numpy as np
 import gymnasium as gym
@@ -17,6 +19,9 @@ import tensorflow as tf
 #from tensorflow import keras
 import keras
 import time
+from stable_baselines3 import PPO
+
+
 
 print(tf.__version__)
 print(keras.__version__)
@@ -345,6 +350,90 @@ class SP500VAEEnv(gym.Env):                              #PPO class setting up t
 
 
 
+class VAETradingEnv(gym.Env):
+    def __init__(self, vae_model, price_data, history_length=90):
+        super(VAETradingEnv, self).__init__()
+
+        self.vae = vae_model
+        self.data = price_data
+        self.history_length = history_length
+        self.current_step = 0
+
+        # Sizes
+        self.latent_dim = vae_model.latent_dim
+        self.forecast_dim = 1                     # ONLY 1 DAY AHEAD FORECAST
+        obs_dim = self.latent_dim + self.forecast_dim
+
+        # Observation space
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
+        )
+
+        # Action space: Hold, Buy, Sell
+        self.action_space = spaces.Discrete(3)
+
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
+        self.current_step = self.history_length
+        obs = self._get_obs()
+        return obs, {}  # ✅ return tuple (obs, info)
+
+
+
+    def _get_obs(self):
+        # Get 90‑day window
+        past_window = self.data[self.current_step - self.history_length : self.current_step]
+        past_window = past_window.astype(np.float32).reshape(1, -1)
+
+        # Encode → z
+        mean, logvar = self.vae.encode(past_window)
+        z = self.vae.reparameterize(mean, logvar)            # shape (1, latent_dim)
+
+        # Decode → forecast sequence
+        x_hat = self.vae.decode(z)                           # shape (1, 91)
+
+        # Extract next‑day forecast ONLY
+        forecast = x_hat[:, -1:]                             # shape (1, 1)
+
+        # Flatten and combine
+        obs = np.concatenate([z.numpy().flatten(),
+                              forecast.numpy().flatten()])
+
+        return obs
+
+    def step(self, action):
+        today = self.data[self.current_step]
+        tomorrow = self.data[self.current_step + 1]
+        today_price = float(self.data[self.current_step][0])
+        tomorrow_price = float(self.data[self.current_step + 1][0])
+
+        price_change = float(tomorrow_price - today_price)
+
+
+
+
+        # Reward logic
+        if action == 1 and price_change > 0:        # Buy
+            reward = 1
+        elif action == 2 and price_change < 0:      # Sell
+            reward = 1
+        elif action == 0 and abs(price_change) < 0.001:
+
+
+            reward = 0
+        else:
+            reward = -1
+        obs = self._get_obs()
+
+        # Move forward
+        self.current_step += 1
+        done = self.current_step >= len(self.data) - 2
+
+        terminated = done
+        truncated = False   # or add your own truncation logic
+
+        return obs, reward, terminated, truncated, {}
+
 
 
 
@@ -379,6 +468,20 @@ def make_vae_state(vae, window_1d):
 
     return z, forecast_value, state_vec
 
+class PPOActor(tf.keras.Model):
+    def __init__(self, input_dim, action_dim):
+        super().__init__()
+        self.fc1 = tf.keras.layers.Dense(64, activation='relu')
+        self.fc2 = tf.keras.layers.Dense(64, activation='relu')
+        self.out = tf.keras.layers.Dense(action_dim, activation='softmax')  # 3 actions: Buy, Sell, Hold
+
+    def call(self, x):
+        x = self.fc1(x)
+        x = self.fc2(x)
+        return self.out(x)
+    
+
+    
 
 
 def rl_env_step(model, prices, index, action):
@@ -444,7 +547,7 @@ print(">>> num_output  =", num_output)
 #print(">>> output_dim  =", output_dim)
 
 
-Train =False
+Train =True
 
 if Train:
     model = VAE(num_input, num_latent, num_output, Predict)
@@ -483,13 +586,30 @@ if Train:
 
 
 
+
+
+
 # Load trained model and test it
 new_model = keras.saving.load_model('vae_keras_dense_predict.keras')
+new_model.trainable = False  # 🔒 Freeze the VAE
+
+# Confirm freezing
+for layer in new_model.layers:
+    print(layer.name, "trainable:", layer.trainable)
+
+
 new_model.summary()
+
+
+
+
 
 for test_x in test_dataset:
     print(">>> test_x shape:", test_x.shape)
     break  # Only need one batch to check
+
+
+
 
 
 
@@ -531,6 +651,15 @@ for i, test_x in enumerate(test_dataset):
         x_hat, z, mean, logvar = new_model(test_x[:1, :90])
         error = np.mean(np.abs(test_x[0, :] - np.squeeze(x_hat)))
         print(f"Avg reconstruction error: {error:.4f}")
+
         
         
+env = VAETradingEnv(vae_model=new_model, price_data=data.r, history_length=90)
+
+
+
+
+model = PPO("MlpPolicy", env, verbose=1)
+model.learn(total_timesteps=10000)
+       
 
